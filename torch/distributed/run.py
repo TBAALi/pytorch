@@ -235,7 +235,7 @@ import os
 import sys
 import uuid
 from argparse import REMAINDER, ArgumentParser
-from typing import List, Tuple
+from typing import Callable, List, Tuple, Union
 
 import torch
 from torch.distributed.argparse_util import check_env, env
@@ -444,19 +444,6 @@ def get_args_parser() -> ArgumentParser:
 
 def parse_args(args):
     parser = get_args_parser()
-
-    #
-    # Legacy arguments.
-    #
-
-    parser.add_argument(
-        "--use_env",
-        default=True,
-        action="store_true",
-        help="Use environment variable to pass local rank. If set to True (default), the script "
-        "will NOT pass --local_rank as argument, and will instead set LOCAL_RANK.",
-    )
-
     return parser.parse_args(args)
 
 
@@ -511,7 +498,20 @@ def get_rdzv_endpoint(args):
     return args.rdzv_endpoint
 
 
-def config_from_args(args) -> Tuple[LaunchConfig, List[str]]:
+def get_use_env(args) -> bool:
+    """
+    Retrieves ``use_env`` from the args.
+    ``use_env`` is a legacy argument, if ``use_env`` is False, the
+    ``--node_rank`` argument will be transferred to all worker processes.
+    ``use_env`` is only used by the ``torch.distributed.launch`` and will
+    be deprecated in future releases.
+    """
+    if not hasattr(args, "use_env"):
+        return True
+    return args.use_env
+
+
+def config_from_args(args) -> Tuple[LaunchConfig, Union[Callable, str], List[str]]:
     # If ``args`` not passed, defaults to ``sys.argv[:1]``
     min_nodes, max_nodes = parse_min_max_nnodes(args.nnodes)
     assert 0 < min_nodes <= max_nodes
@@ -556,17 +556,21 @@ def config_from_args(args) -> Tuple[LaunchConfig, List[str]]:
     )
 
     with_python = not args.no_python
-    cmd = []
+    cmd: Union[Callable, str]
+    cmd_args = []
+    use_env = get_use_env(args)
     if args.run_path:
-        cmd.append(run_script_path)
-        cmd.append(args.training_script)
+        cmd = run_script_path
+        cmd_args.append(args.training_script)
     else:
         if with_python:
-            cmd = [sys.executable, "-u"]
+            cmd = sys.executable
+            cmd_args.append("-u")
             if args.module:
-                cmd.append("-m")
+                cmd_args.append("-m")
+            cmd_args.append(args.training_script)
         else:
-            if not args.use_env:
+            if not use_env:
                 raise ValueError(
                     "When using the '--no_python' flag,"
                     " you must also set the '--use_env' flag."
@@ -576,16 +580,16 @@ def config_from_args(args) -> Tuple[LaunchConfig, List[str]]:
                     "Don't use both the '--no_python' flag"
                     " and the '--module' flag at the same time."
                 )
-        cmd.append(args.training_script)
-    if not args.use_env:
+            cmd = args.training_script
+    if not use_env:
         log.warning(
             "--use_env is deprecated and will be removed in future releases.\n"
             " Please read local_rank from `os.environ('LOCAL_RANK')` instead."
         )
-        cmd.append(f"--local_rank={macros.local_rank}")
-    cmd.extend(args.training_script_args)
+        cmd_args.append(f"--local_rank={macros.local_rank}")
+    cmd_args.extend(args.training_script_args)
 
-    return config, cmd
+    return config, cmd, cmd_args
 
 
 def run_script_path(training_script: str, *training_script_args: str):
@@ -614,9 +618,11 @@ def run(args):
             f"**************************************\n"
         )
 
-    config, cmd = config_from_args(args)
-
-    elastic_launch(config=config, entrypoint=cmd[0],)(*cmd[1:])
+    config, cmd, cmd_args = config_from_args(args)
+    elastic_launch(
+        config=config,
+        entrypoint=cmd,
+    )(*cmd_args)
 
 
 def main(args=None):
